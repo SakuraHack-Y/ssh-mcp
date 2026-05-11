@@ -54,7 +54,19 @@ def _safe_tool(func):
             return func(*args, **kwargs)
         except paramiko.SSHException as e:
             logger.warning(f"[{func.__name__}] SSH异常: {e}")
-            return f"SSH 错误（连接可能已断开）：{type(e).__name__}: {e}"
+            # 清理死连接，下次调用会自动重连
+            identifier = kwargs.get("identifier") or (args[0] if args else None)
+            if identifier:
+                info = _resolve_host(identifier)
+                alias = info["alias"] if info else identifier
+                dead = connections.pop(alias, None)
+                if dead:
+                    try:
+                        dead.close()
+                    except Exception:
+                        pass
+                    logger.info(f"[自动清理] {alias} 死连接已移除")
+            return f"SSH 错误（将自动重连，请重试）：{e}"
         except ConnectionError as e:
             logger.warning(f"[{func.__name__}] 连接错误: {e}")
             return f"连接错误：{type(e).__name__}: {e}"
@@ -116,14 +128,11 @@ def _get_alias_and_client(identifier: str):
 
 
 def _is_client_alive(client: paramiko.SSHClient) -> bool:
-    """检测 SSH 连接是否存活（通过实际执行命令验证）。"""
+    """检测 SSH 连接是否存活。"""
     try:
         transport = client.get_transport()
         if transport is None or not transport.is_active():
             return False
-        # 用实际命令验证会话是否真正可用
-        _, stdout, _ = client.exec_command("echo ok", timeout=5)
-        stdout.read()
         return True
     except Exception:
         return False

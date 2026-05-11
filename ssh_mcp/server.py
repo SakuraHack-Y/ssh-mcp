@@ -1,3 +1,4 @@
+import contextlib
 import functools
 import hashlib
 import json
@@ -6,6 +7,7 @@ import os
 import socket
 import stat
 import threading
+import time
 import traceback
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
@@ -66,7 +68,7 @@ def _safe_tool(func):
                     except Exception:
                         pass
                     logger.info(f"[自动清理] {alias} 死连接已移除")
-            return f"SSH 错误（将自动重连，请重试）：{e}"
+            return f"SSH 连接已断开（已自动清理）。请调用 connect_host 重新连接后重试。"
         except ConnectionError as e:
             logger.warning(f"[{func.__name__}] 连接错误: {e}")
             return f"连接错误：{type(e).__name__}: {e}"
@@ -95,6 +97,7 @@ def _load_config() -> dict:
 
 def _resolve_host(identifier: str) -> dict | None:
     config = _load_config()
+    # 1. 精确匹配别名
     if identifier in config:
         entry = config[identifier]
         return {
@@ -104,27 +107,52 @@ def _resolve_host(identifier: str) -> dict | None:
             "username": entry.get("username", "root"),
             "password": entry.get("password", ""),
         }
+    # 2. 匹配 host:port 格式（如 106.53.212.173:6001）
+    if ":" in identifier:
+        host_part, _, port_part = identifier.rpartition(":")
+        if port_part.isdigit():
+            for alias, entry in config.items():
+                if entry.get("host") == host_part and entry.get("port", 22) == int(port_part):
+                    return {
+                        "alias": alias,
+                        "host": entry["host"],
+                        "port": entry.get("port", 22),
+                        "username": entry.get("username", "root"),
+                        "password": entry.get("password", ""),
+                    }
+    # 3. 匹配 IP（仅当唯一时）
+    matches = []
     for alias, entry in config.items():
         if entry.get("host") == identifier:
-            return {
-                "alias": alias,
-                "host": entry["host"],
-                "port": entry.get("port", 22),
-                "username": entry.get("username", "root"),
-                "password": entry.get("password", ""),
-            }
+            matches.append((alias, entry))
+    if len(matches) == 1:
+        alias, entry = matches[0]
+        return {
+            "alias": alias,
+            "host": entry["host"],
+            "port": entry.get("port", 22),
+            "username": entry.get("username", "root"),
+            "password": entry.get("password", ""),
+        }
+    if len(matches) > 1:
+        # 多个主机同名 IP，返回特殊标记让调用者给出提示
+        aliases = [a for a, _ in matches]
+        return {
+            "alias": "__ambiguous__",
+            "ambiguous_aliases": aliases,
+            "host": identifier,
+        }
     return None
 
 
-def _get_client(identifier: str) -> paramiko.SSHClient | None:
-    return connections.get(identifier)
-
-
-def _get_alias_and_client(identifier: str):
+def _get_alias(identifier: str) -> str:
+    """从 identifier 解析别名，处理歧义情况。"""
     info = _resolve_host(identifier)
-    alias = info["alias"] if info else identifier
-    client = _get_client(alias)
-    return alias, client
+    if info is None:
+        return identifier
+    if info.get("alias") == "__ambiguous__":
+        return identifier
+    return info["alias"]
 
 
 def _is_client_alive(client: paramiko.SSHClient) -> bool:
@@ -142,17 +170,17 @@ def _do_connect(host: str, port: int, username: str, password: str) -> paramiko.
     """建立 SSH 连接，带重试逻辑。"""
     last_err = None
     for attempt in range(3):
+        client = paramiko.SSHClient()
+        client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
         try:
-            client = paramiko.SSHClient()
-            client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
             client.connect(
                 hostname=host,
                 port=port,
                 username=username,
                 password=password,
-                timeout=15,
-                banner_timeout=30,
-                auth_timeout=30,
+                timeout=10,
+                banner_timeout=15,
+                auth_timeout=15,
                 allow_agent=False,
                 look_for_keys=False,
             )
@@ -162,40 +190,30 @@ def _do_connect(host: str, port: int, username: str, password: str) -> paramiko.
             return client
         except Exception as e:
             last_err = e
+            try:
+                client.close()
+            except Exception:
+                pass
             logger.warning(f"[连接重试] 第{attempt+1}次失败: {e}")
-            import time
             time.sleep(2)
     raise last_err
 
 
-# 连接参数缓存，用于自动重连
-_conn_params: dict[str, dict] = {}
-
 
 def _ensure_alive(alias: str) -> paramiko.SSHClient | None:
-    """获取连接，如果已断开则自动重连。"""
+    """获取连接，如果已断开则清理并返回 None（不自动重连，避免阻塞 MCP 进程）。"""
     client = connections.get(alias)
     if client is not None and _is_client_alive(client):
         return client
-    # 连接已断开，尝试自动重连
+    # 连接已断开，仅清理
     if client is not None:
         try:
             client.close()
         except Exception:
             pass
         connections.pop(alias, None)
-    params = _conn_params.get(alias)
-    if params is None:
-        return None
-    try:
-        logger.info(f"[自动重连] {alias}")
-        client = _do_connect(params["host"], params["port"], params["username"], params["password"])
-        connections[alias] = client
-        logger.info(f"[自动重连成功] {alias}")
-        return client
-    except Exception as e:
-        logger.warning(f"[自动重连失败] {alias}: {e}")
-        return None
+        logger.info(f"[连接清理] {alias} 已断开")
+    return None
 
 
 def _exec_on(client: paramiko.SSHClient, command: str, timeout: int = 30) -> str:
@@ -218,6 +236,19 @@ def _local_sha256(path: str) -> str:
         while chunk := f.read(8192):
             h.update(chunk)
     return h.hexdigest()
+
+
+@contextlib.contextmanager
+def _sftp(client: paramiko.SSHClient):
+    """SFTP 上下文管理器，确保异常时也会关闭 SFTP 会话。"""
+    sftp = client.open_sftp()
+    try:
+        yield sftp
+    finally:
+        try:
+            sftp.close()
+        except Exception:
+            pass
 
 
 def _remote_sha256(client: paramiko.SSHClient, path: str) -> str | None:
@@ -294,8 +325,8 @@ def list_hosts() -> str:
         port = entry.get("port", 22)
         username = entry.get("username", "root")
         desc = entry.get("description", "")
-        client = _ensure_alive(alias)
-        status = "已连接" if client else "未连接"
+        client = connections.get(alias)
+        status = "已连接" if (client and _is_client_alive(client)) else "未连接"
         lines.append(
             f"  [{status}] {alias} - {username}@{host}:{port}"
             + (f" ({desc})" if desc else "")
@@ -320,6 +351,12 @@ def connect_host(identifier: str, username: str = "", password: str = "", port: 
             return f"未找到主机 '{identifier}' 的配置。请先在 hosts.yaml 中添加，或提供用户名和密码。"
         return f"未找到主机 '{identifier}'。请检查别名是否正确。"
 
+    # 同名 IP 多主机歧义
+    if info.get("alias") == "__ambiguous__":
+        aliases = info.get("ambiguous_aliases", [])
+        port_examples = ", ".join(f"{a}" for a in aliases)
+        return f"IP {identifier} 对应多台主机：{port_examples}。请使用别名连接。"
+
     alias = info["alias"]
 
     # 检查是否已有存活连接
@@ -340,8 +377,6 @@ def connect_host(identifier: str, username: str = "", password: str = "", port: 
     pwd = password or info["password"]
 
     client = _do_connect(host, p, user, pwd)
-    # 缓存连接参数，用于自动重连
-    _conn_params[alias] = {"host": host, "port": p, "username": user, "password": pwd}
     connections[alias] = client
     logger.info(f"[连接成功] {alias} ({user}@{host}:{p})")
     return f"成功连接到 {alias} ({user}@{host}:{p})"
@@ -357,6 +392,23 @@ def disconnect_host(identifier: str) -> str:
     """
     info = _resolve_host(identifier)
     alias = info["alias"] if info else identifier
+
+    # 清理关联的隧道
+    for t in tunnels.pop(alias, []):
+        t["stop_event"].set()
+        try:
+            t["server_sock"].close()
+        except OSError:
+            pass
+
+    # 清理关联的代理
+    proxy_info = proxy_tunnels.pop(alias, None)
+    if proxy_info:
+        proxy_info["stop_event"].set()
+        try:
+            proxy_info["transport"].cancel_port_forward("127.0.0.1", proxy_info["remote_proxy_port"])
+        except Exception:
+            pass
 
     client = connections.pop(alias, None)
     if client is None:
@@ -401,18 +453,17 @@ def upload_file(identifier: str, local_path: str, remote_path: str) -> str:
         local_path: 本地文件路径
         remote_path: 远程目标路径（以 / 结尾视为目录，否则视为完整路径）
     """
-    alias, client = _get_alias_and_client(identifier)
+    alias = _get_alias(identifier)
     client = _ensure_alive(alias)
     if client is None:
         return f"主机 '{identifier}' 未连接或已断开。请先 connect_host。"
     if not os.path.isfile(local_path):
         return f"本地文件不存在：{local_path}"
 
-    sftp = client.open_sftp()
     filename = os.path.basename(local_path)
     dest = remote_path.rstrip("/") + "/" + filename if remote_path.endswith("/") else remote_path
-    sftp.put(local_path, dest)
-    sftp.close()
+    with _sftp(client) as sftp:
+        sftp.put(local_path, dest)
     return f"文件上传成功：{local_path} -> {alias}:{dest}"
 
 
@@ -426,19 +477,18 @@ def download_file(identifier: str, remote_path: str, local_path: str) -> str:
         remote_path: 远程文件路径
         local_path: 本地保存路径（以 / 或 \\ 结尾视为目录）
     """
-    alias, client = _get_alias_and_client(identifier)
+    alias = _get_alias(identifier)
     client = _ensure_alive(alias)
     if client is None:
         return f"主机 '{identifier}' 未连接或已断开。请先 connect_host。"
 
-    sftp = client.open_sftp()
     if local_path.endswith(("/", "\\")):
         os.makedirs(local_path, exist_ok=True)
         local_path = os.path.join(local_path, os.path.basename(remote_path))
     else:
         os.makedirs(os.path.dirname(local_path) or ".", exist_ok=True)
-    sftp.get(remote_path, local_path)
-    sftp.close()
+    with _sftp(client) as sftp:
+        sftp.get(remote_path, local_path)
     return f"文件下载成功：{alias}:{remote_path} -> {local_path}"
 
 
@@ -452,17 +502,16 @@ def upload_dir(identifier: str, local_dir: str, remote_dir: str) -> str:
         local_dir: 本地目录路径
         remote_dir: 远程目标目录路径
     """
-    alias, client = _get_alias_and_client(identifier)
+    alias = _get_alias(identifier)
     client = _ensure_alive(alias)
     if client is None:
         return f"主机 '{identifier}' 未连接或已断开。请先 connect_host。"
     if not os.path.isdir(local_dir):
         return f"本地目录不存在：{local_dir}"
 
-    sftp = client.open_sftp()
     count = 0
 
-    def _upload_recursive(local_base: str, remote_base: str):
+    def _upload_recursive(sftp, local_base: str, remote_base: str):
         nonlocal count
         _mkdirs_remote(sftp, remote_base)
         for entry in os.scandir(local_base):
@@ -471,10 +520,10 @@ def upload_dir(identifier: str, local_dir: str, remote_dir: str) -> str:
                 sftp.put(entry.path, remote_entry)
                 count += 1
             elif entry.is_dir():
-                _upload_recursive(entry.path, remote_entry)
+                _upload_recursive(sftp, entry.path, remote_entry)
 
-    _upload_recursive(local_dir, remote_dir)
-    sftp.close()
+    with _sftp(client) as sftp:
+        _upload_recursive(sftp, local_dir, remote_dir)
     return f"目录上传成功：{local_dir} -> {alias}:{remote_dir}（共 {count} 个文件）"
 
 
@@ -488,28 +537,27 @@ def download_dir(identifier: str, remote_dir: str, local_dir: str) -> str:
         remote_dir: 远程目录路径
         local_dir: 本地目标目录路径
     """
-    alias, client = _get_alias_and_client(identifier)
+    alias = _get_alias(identifier)
     client = _ensure_alive(alias)
     if client is None:
         return f"主机 '{identifier}' 未连接或已断开。请先 connect_host。"
 
-    sftp = client.open_sftp()
     count = 0
 
-    def _download_recursive(remote_base: str, local_base: str):
+    def _download_recursive(sftp, remote_base: str, local_base: str):
         nonlocal count
         os.makedirs(local_base, exist_ok=True)
         for entry in sftp.listdir_attr(remote_base):
             remote_entry = remote_base.rstrip("/") + "/" + entry.filename
             local_entry = os.path.join(local_base, entry.filename)
             if stat.S_ISDIR(entry.st_mode):
-                _download_recursive(remote_entry, local_entry)
+                _download_recursive(sftp, remote_entry, local_entry)
             else:
                 sftp.get(remote_entry, local_entry)
                 count += 1
 
-    _download_recursive(remote_dir, local_dir)
-    sftp.close()
+    with _sftp(client) as sftp:
+        _download_recursive(sftp, remote_dir, local_dir)
     return f"目录下载成功：{alias}:{remote_dir} -> {local_dir}（共 {count} 个文件）"
 
 
@@ -522,14 +570,13 @@ def remote_file_info(identifier: str, remote_path: str) -> str:
         identifier: 主机别名或 IP 地址
         remote_path: 远程文件路径
     """
-    alias, client = _get_alias_and_client(identifier)
+    alias = _get_alias(identifier)
     client = _ensure_alive(alias)
     if client is None:
         return f"主机 '{identifier}' 未连接或已断开。请先 connect_host。"
 
-    sftp = client.open_sftp()
-    attr = sftp.stat(remote_path)
-    sftp.close()
+    with _sftp(client) as sftp:
+        attr = sftp.stat(remote_path)
 
     perms = stat.filemode(attr.st_mode)
     size = attr.st_size
@@ -562,7 +609,7 @@ def sync_file(identifier: str, local_path: str, remote_path: str) -> str:
         local_path: 本地文件路径
         remote_path: 远程目标路径
     """
-    alias, client = _get_alias_and_client(identifier)
+    alias = _get_alias(identifier)
     client = _ensure_alive(alias)
     if client is None:
         return f"主机 '{identifier}' 未连接或已断开。请先 connect_host。"
@@ -575,9 +622,8 @@ def sync_file(identifier: str, local_path: str, remote_path: str) -> str:
     if local_hash == remote_hash:
         return f"文件已是最新，无需同步（SHA256: {local_hash[:16]}...）"
 
-    sftp = client.open_sftp()
-    sftp.put(local_path, remote_path)
-    sftp.close()
+    with _sftp(client) as sftp:
+        sftp.put(local_path, remote_path)
     return f"文件已同步：{local_path} -> {alias}:{remote_path}\n  本地  SHA256: {local_hash[:16]}...\n  远程旧 SHA256: {remote_hash[:16] if remote_hash else 'N/A'}..."
 
 
@@ -596,7 +642,7 @@ def backup_remote_file(identifier: str, remote_path: str, tag: str = "") -> str:
         remote_path: 远程文件路径
         tag: 可选标签，用于区分同一文件的多个备份
     """
-    alias, client = _get_alias_and_client(identifier)
+    alias = _get_alias(identifier)
     client = _ensure_alive(alias)
     if client is None:
         return f"主机 '{identifier}' 未连接或已断开。请先 connect_host。"
@@ -608,9 +654,8 @@ def backup_remote_file(identifier: str, remote_path: str, tag: str = "") -> str:
     backup_path = BACKUP_DIR / alias / backup_name
     backup_path.parent.mkdir(parents=True, exist_ok=True)
 
-    sftp = client.open_sftp()
-    sftp.get(remote_path, str(backup_path))
-    sftp.close()
+    with _sftp(client) as sftp:
+        sftp.get(remote_path, str(backup_path))
     return f"备份成功：{alias}:{remote_path} -> {backup_path}"
 
 
@@ -625,7 +670,7 @@ def restore_remote_file(identifier: str, remote_path: str, tag: str = "", backup
         tag: 可选，恢复指定标签的备份
         backup_file: 可选，精确指定备份文件名（优先于 tag）
     """
-    alias, client = _get_alias_and_client(identifier)
+    alias = _get_alias(identifier)
     client = _ensure_alive(alias)
     if client is None:
         return f"主机 '{identifier}' 未连接或已断开。请先 connect_host。"
@@ -648,9 +693,8 @@ def restore_remote_file(identifier: str, remote_path: str, tag: str = "", backup
 
     latest = candidates[-1]
 
-    sftp = client.open_sftp()
-    sftp.put(str(latest), remote_path)
-    sftp.close()
+    with _sftp(client) as sftp:
+        sftp.put(str(latest), remote_path)
     return f"恢复成功：{latest.name} -> {alias}:{remote_path}"
 
 
@@ -754,9 +798,8 @@ def batch_upload(identifiers: list[str], local_path: str, remote_path: str) -> s
         if client is None:
             return alias, "未连接或已断开"
         try:
-            sftp = client.open_sftp()
-            sftp.put(local_path, remote_path)
-            sftp.close()
+            with _sftp(client) as sftp:
+                sftp.put(local_path, remote_path)
             return alias, "成功"
         except Exception as e:
             return alias, f"{type(e).__name__}: {e}"
@@ -793,7 +836,7 @@ def manage_service(identifier: str, service: str, action: str) -> str:
     if action not in valid:
         return f"无效操作 '{action}'，可选：{', '.join(valid)}"
 
-    alias, client = _get_alias_and_client(identifier)
+    alias = _get_alias(identifier)
     client = _ensure_alive(alias)
     if client is None:
         return f"主机 '{identifier}' 未连接或已断开。请先 connect_host。"
@@ -823,7 +866,7 @@ def list_processes(identifier: str, filter_name: str = "") -> str:
         identifier: 主机别名或 IP 地址
         filter_name: 可选，按进程名过滤（支持 grep 模式）
     """
-    alias, client = _get_alias_and_client(identifier)
+    alias = _get_alias(identifier)
     client = _ensure_alive(alias)
     if client is None:
         return f"主机 '{identifier}' 未连接或已断开。"
@@ -845,7 +888,7 @@ def tail_log(identifier: str, log_path: str, lines: int = 50) -> str:
         log_path: 日志文件路径
         lines: 读取行数，默认 50
     """
-    alias, client = _get_alias_and_client(identifier)
+    alias = _get_alias(identifier)
     client = _ensure_alive(alias)
     if client is None:
         return f"主机 '{identifier}' 未连接或已断开。"
@@ -862,7 +905,7 @@ def list_services(identifier: str, status_filter: str = "") -> str:
         identifier: 主机别名或 IP 地址
         status_filter: 可选，按状态过滤：running / failed / exited / active
     """
-    alias, client = _get_alias_and_client(identifier)
+    alias = _get_alias(identifier)
     client = _ensure_alive(alias)
     if client is None:
         return f"主机 '{identifier}' 未连接或已断开。"
@@ -970,7 +1013,7 @@ def create_tunnel(identifier: str, local_port: int, remote_host: str = "127.0.0.
         remote_host: 远程目标地址，默认 127.0.0.1（即远程主机自身）
         remote_port: 远程目标端口，默认与 local_port 相同
     """
-    alias, client = _get_alias_and_client(identifier)
+    alias = _get_alias(identifier)
     client = _ensure_alive(alias)
     if client is None:
         return f"主机 '{identifier}' 未连接或已断开。"
@@ -1003,7 +1046,7 @@ def close_tunnel(identifier: str, local_port: int) -> str:
         identifier: 主机别名或 IP 地址
         local_port: 要关闭的本地端口号
     """
-    alias, _ = _get_alias_and_client(identifier)
+    alias = _get_alias(identifier)
     active = tunnels.get(alias, [])
     for i, t in enumerate(active):
         if t.get("local_port") == local_port:
@@ -1066,7 +1109,7 @@ def find_remote(identifier: str, path: str = "/", name: str = "", type_filter: s
         max_depth: 最大搜索深度，0=不限制
         limit: 最多返回条数，默认 50
     """
-    alias, client = _get_alias_and_client(identifier)
+    alias = _get_alias(identifier)
     client = _ensure_alive(alias)
     if client is None:
         return f"主机 '{identifier}' 未连接或已断开。"
@@ -1093,15 +1136,14 @@ def read_remote_file(identifier: str, remote_path: str, encoding: str = "utf-8")
         remote_path: 远程文件路径
         encoding: 文件编码，默认 utf-8
     """
-    alias, client = _get_alias_and_client(identifier)
+    alias = _get_alias(identifier)
     client = _ensure_alive(alias)
     if client is None:
         return f"主机 '{identifier}' 未连接或已断开。"
 
-    sftp = client.open_sftp()
-    with sftp.open(remote_path, "r") as f:
-        content = f.read().decode(encoding, errors="replace")
-    sftp.close()
+    with _sftp(client) as sftp:
+        with sftp.open(remote_path, "r") as f:
+            content = f.read().decode(encoding, errors="replace")
     return f"=== {alias}:{remote_path} ===\n{content}"
 
 
@@ -1116,7 +1158,7 @@ def edit_remote_file(identifier: str, remote_path: str, content: str, auto_backu
         content: 要写入的完整内容
         auto_backup: 是否自动备份原文件，默认 True
     """
-    alias, client = _get_alias_and_client(identifier)
+    alias = _get_alias(identifier)
     client = _ensure_alive(alias)
     if client is None:
         return f"主机 '{identifier}' 未连接或已断开。"
@@ -1127,10 +1169,9 @@ def edit_remote_file(identifier: str, remote_path: str, content: str, auto_backu
         except Exception:
             pass
 
-    sftp = client.open_sftp()
-    with sftp.open(remote_path, "w") as f:
-        f.write(content.encode("utf-8"))
-    sftp.close()
+    with _sftp(client) as sftp:
+        with sftp.open(remote_path, "w") as f:
+            f.write(content.encode("utf-8"))
     return f"文件已写入：{alias}:{remote_path}"
 
 
@@ -1159,7 +1200,7 @@ def _reverse_accept_loop(transport, local_host, local_port, stop_event):
 
 @mcp.tool()
 @_safe_tool
-def setup_proxy(identifier: str, local_proxy_port: int = 10808, remote_proxy_port: int = 1080) -> str:
+def setup_proxy(identifier: str, local_proxy_port: int = 10808, remote_proxy_port: int = 11080) -> str:
     """建立反向代理隧道（SSH 远程端口转发），让远程服务器通过你本地电脑的代理（如 Clash、V2Ray）上网。使用前需确保本地代理已在运行。配合 exec_with_proxy 使用。
 
     流量路径：远程服务器 -> SSH隧道 -> 本地代理(10808) -> 目标网站
@@ -1169,7 +1210,7 @@ def setup_proxy(identifier: str, local_proxy_port: int = 10808, remote_proxy_por
         local_proxy_port: 本地代理端口，默认 10808
         remote_proxy_port: 远程服务器上的监听端口，默认 1080
     """
-    alias, client = _get_alias_and_client(identifier)
+    alias = _get_alias(identifier)
     client = _ensure_alive(alias)
     if client is None:
         return f"主机 '{identifier}' 未连接或已断开。"
@@ -1224,7 +1265,7 @@ def teardown_proxy(identifier: str) -> str:
     Args:
         identifier: 主机别名或 IP 地址
     """
-    alias, _ = _get_alias_and_client(identifier)
+    alias = _get_alias(identifier)
 
     info = proxy_tunnels.pop(alias, None)
     if info is None:
@@ -1249,7 +1290,7 @@ def exec_with_proxy(identifier: str, command: str, timeout: int = 60) -> str:
         command: 要执行的命令
         timeout: 超时时间（秒），默认 60
     """
-    alias, client = _get_alias_and_client(identifier)
+    alias = _get_alias(identifier)
     client = _ensure_alive(alias)
     if client is None:
         return f"主机 '{identifier}' 未连接或已断开。"

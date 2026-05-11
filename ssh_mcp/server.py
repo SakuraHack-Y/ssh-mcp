@@ -41,6 +41,20 @@ _file_handler.setFormatter(logging.Formatter(
 ))
 logger.addHandler(_file_handler)
 
+# 进程级异常兜底：捕获 threading/asyncio 等未处理异常
+def _global_exception_handler(exc_type, exc_val, exc_tb):
+    logger.critical(f"[进程级异常] {exc_type.__name__}: {exc_val}\n{''.join(traceback.format_tb(exc_tb))}")
+
+import sys
+sys.excepthook = _global_exception_handler
+threading.excepthook = lambda args: logger.critical(
+    f"[线程异常] {args.exc_type.__name__}: {args.exc_value}\n{''.join(traceback.format_tb(args.exc_traceback))}"
+)
+
+logger.info("=" * 50)
+logger.info(f"[MCP启动] Python {sys.version}, PID={os.getpid()}")
+logger.info("=" * 50)
+
 
 # ============================================================
 # 基础设施：异常兜底 + 连接管理
@@ -48,15 +62,29 @@ logger.addHandler(_file_handler)
 
 
 def _safe_tool(func):
-    """装饰器：捕获所有未处理异常，记录日志，防止 MCP 服务器进程崩溃。"""
+    """装饰器：捕获所有未处理异常，记录日志，防止 MCP 服务器进程崩溃。同时记录每次调用的入参和耗时。"""
 
     @functools.wraps(func)
     def wrapper(*args, **kwargs):
+        # 构建调用摘要（截断过长的参数值）
+        call_args = []
+        for k, v in kwargs.items():
+            s = str(v)
+            call_args.append(f"{k}={s[:100]}{'...' if len(s) > 100 else ''}")
+        call_summary = f"{func.__name__}({', '.join(call_args)})"
+        logger.info(f"[调用] {call_summary}")
+        start = time.monotonic()
         try:
-            return func(*args, **kwargs)
+            result = func(*args, **kwargs)
+            elapsed = time.monotonic() - start
+            # 截断结果用于日志
+            result_preview = result[:200] + "..." if len(result) > 200 else result
+            logger.info(f"[完成] {func.__name__} ({elapsed:.2f}s) -> {result_preview}")
+            return result
         except paramiko.SSHException as e:
-            logger.warning(f"[{func.__name__}] SSH异常: {e}")
-            # 清理死连接，下次调用会自动重连
+            elapsed = time.monotonic() - start
+            logger.warning(f"[{func.__name__}] SSH异常 ({elapsed:.2f}s): {e}")
+            # 清理死连接
             identifier = kwargs.get("identifier") or (args[0] if args else None)
             if identifier:
                 info = _resolve_host(identifier)
@@ -70,19 +98,24 @@ def _safe_tool(func):
                     logger.info(f"[自动清理] {alias} 死连接已移除")
             return f"SSH 连接已断开（已自动清理）。请调用 connect_host 重新连接后重试。"
         except ConnectionError as e:
-            logger.warning(f"[{func.__name__}] 连接错误: {e}")
+            elapsed = time.monotonic() - start
+            logger.warning(f"[{func.__name__}] 连接错误 ({elapsed:.2f}s): {e}")
             return f"连接错误：{type(e).__name__}: {e}"
         except PermissionError as e:
-            logger.warning(f"[{func.__name__}] 权限拒绝: {e}")
+            elapsed = time.monotonic() - start
+            logger.warning(f"[{func.__name__}] 权限拒绝 ({elapsed:.2f}s): {e}")
             return f"权限不足：{e}"
         except TimeoutError as e:
-            logger.warning(f"[{func.__name__}] 超时: {e}")
+            elapsed = time.monotonic() - start
+            logger.warning(f"[{func.__name__}] 超时 ({elapsed:.2f}s): {e}")
             return f"操作超时：{e}"
         except FileNotFoundError as e:
-            logger.warning(f"[{func.__name__}] 文件不存在: {e}")
+            elapsed = time.monotonic() - start
+            logger.warning(f"[{func.__name__}] 文件不存在 ({elapsed:.2f}s): {e}")
             return f"文件不存在：{e}"
         except Exception as e:
-            logger.error(f"[{func.__name__}] 未捕获异常: {traceback.format_exc()}")
+            elapsed = time.monotonic() - start
+            logger.error(f"[{func.__name__}] 未捕获异常 ({elapsed:.2f}s): {traceback.format_exc()}")
             return f"内部错误：{type(e).__name__}: {e}"
 
     return wrapper

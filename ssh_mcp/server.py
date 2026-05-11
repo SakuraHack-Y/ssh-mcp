@@ -58,6 +58,15 @@ def _safe_tool(func):
         except ConnectionError as e:
             logger.warning(f"[{func.__name__}] 连接错误: {e}")
             return f"连接错误：{type(e).__name__}: {e}"
+        except PermissionError as e:
+            logger.warning(f"[{func.__name__}] 权限拒绝: {e}")
+            return f"权限不足：{e}"
+        except TimeoutError as e:
+            logger.warning(f"[{func.__name__}] 超时: {e}")
+            return f"操作超时：{e}"
+        except FileNotFoundError as e:
+            logger.warning(f"[{func.__name__}] 文件不存在: {e}")
+            return f"文件不存在：{e}"
         except Exception as e:
             logger.error(f"[{func.__name__}] 未捕获异常: {traceback.format_exc()}")
             return f"内部错误：{type(e).__name__}: {e}"
@@ -107,12 +116,14 @@ def _get_alias_and_client(identifier: str):
 
 
 def _is_client_alive(client: paramiko.SSHClient) -> bool:
-    """检测 SSH 连接是否存活。"""
+    """检测 SSH 连接是否存活（通过实际执行命令验证）。"""
     try:
         transport = client.get_transport()
-        if transport is None:
+        if transport is None or not transport.is_active():
             return False
-        transport.send_ignore()
+        # 用实际命令验证会话是否真正可用
+        _, stdout, _ = client.exec_command("echo ok", timeout=5)
+        stdout.read()
         return True
     except Exception:
         return False
@@ -294,20 +305,30 @@ def connect_host(identifier: str, username: str = "", password: str = "", port: 
         password: 可选，覆盖配置中的密码
         port: 可选，覆盖配置中的端口
     """
-    if identifier in connections:
-        return f"主机 '{identifier}' 已经连接。"
-
     info = _resolve_host(identifier)
     if info is None:
         if "@" in identifier or identifier.replace(".", "").isdigit():
             return f"未找到主机 '{identifier}' 的配置。请先在 hosts.yaml 中添加，或提供用户名和密码。"
         return f"未找到主机 '{identifier}'。请检查别名是否正确。"
 
+    alias = info["alias"]
+
+    # 检查是否已有存活连接
+    existing = connections.get(alias)
+    if existing is not None and _is_client_alive(existing):
+        return f"主机 '{alias}' 已经连接。"
+    # 清理死连接
+    if existing is not None:
+        try:
+            existing.close()
+        except Exception:
+            pass
+        connections.pop(alias, None)
+
     host = info["host"]
     p = port or info["port"]
     user = username or info["username"]
     pwd = password or info["password"]
-    alias = info["alias"]
 
     client = _do_connect(host, p, user, pwd)
     # 缓存连接参数，用于自动重连

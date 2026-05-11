@@ -276,6 +276,10 @@ def connect_host(identifier: str, username: str = "", password: str = "", port: 
         allow_agent=False,
         look_for_keys=False,
     )
+    # 启用 keepalive，防止空闲连接被断开
+    transport = client.get_transport()
+    if transport:
+        transport.set_keepalive(30)
     connections[alias] = client
     logger.info(f"[连接成功] {alias} ({user}@{host}:{p})")
     return f"成功连接到 {alias} ({user}@{host}:{p})"

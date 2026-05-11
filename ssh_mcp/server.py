@@ -118,20 +118,64 @@ def _is_client_alive(client: paramiko.SSHClient) -> bool:
         return False
 
 
+def _do_connect(host: str, port: int, username: str, password: str) -> paramiko.SSHClient:
+    """建立 SSH 连接，带重试逻辑。"""
+    last_err = None
+    for attempt in range(3):
+        try:
+            client = paramiko.SSHClient()
+            client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+            client.connect(
+                hostname=host,
+                port=port,
+                username=username,
+                password=password,
+                timeout=15,
+                banner_timeout=30,
+                auth_timeout=30,
+                allow_agent=False,
+                look_for_keys=False,
+            )
+            transport = client.get_transport()
+            if transport:
+                transport.set_keepalive(30)
+            return client
+        except Exception as e:
+            last_err = e
+            logger.warning(f"[连接重试] 第{attempt+1}次失败: {e}")
+            import time
+            time.sleep(2)
+    raise last_err
+
+
+# 连接参数缓存，用于自动重连
+_conn_params: dict[str, dict] = {}
+
+
 def _ensure_alive(alias: str) -> paramiko.SSHClient | None:
-    """获取连接，如果已断开则自动清理并返回 None。"""
+    """获取连接，如果已断开则自动重连。"""
     client = connections.get(alias)
-    if client is None:
-        return None
-    if _is_client_alive(client):
+    if client is not None and _is_client_alive(client):
         return client
-    logger.warning(f"[连接清理] {alias} 连接已断开，自动清理")
+    # 连接已断开，尝试自动重连
+    if client is not None:
+        try:
+            client.close()
+        except Exception:
+            pass
+        connections.pop(alias, None)
+    params = _conn_params.get(alias)
+    if params is None:
+        return None
     try:
-        client.close()
-    except Exception:
-        pass
-    connections.pop(alias, None)
-    return None
+        logger.info(f"[自动重连] {alias}")
+        client = _do_connect(params["host"], params["port"], params["username"], params["password"])
+        connections[alias] = client
+        logger.info(f"[自动重连成功] {alias}")
+        return client
+    except Exception as e:
+        logger.warning(f"[自动重连失败] {alias}: {e}")
+        return None
 
 
 def _exec_on(client: paramiko.SSHClient, command: str, timeout: int = 30) -> str:
@@ -242,7 +286,7 @@ def list_hosts() -> str:
 @mcp.tool()
 @_safe_tool
 def connect_host(identifier: str, username: str = "", password: str = "", port: int = 0) -> str:
-    """通过别名或 IP 建立 SSH 连接。连接成功后才能使用其他远程操作工具。如果主机已连接则跳过。使用前需在 hosts.yaml 中配置主机信息。
+    """通过别名或 IP 建立 SSH 连接。连接成功后才能使用其他远程操作工具。如果主机已连接则跳过。使用前需在 hosts.yaml 中配置主机信息。连接失败时自动重试3次。连接断开后其他工具会自动尝试重连，无需手动调用此函数。
 
     Args:
         identifier: 主机别名（如 "主机1"）或 IP 地址
@@ -265,21 +309,9 @@ def connect_host(identifier: str, username: str = "", password: str = "", port: 
     pwd = password or info["password"]
     alias = info["alias"]
 
-    client = paramiko.SSHClient()
-    client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-    client.connect(
-        hostname=host,
-        port=p,
-        username=user,
-        password=pwd,
-        timeout=10,
-        allow_agent=False,
-        look_for_keys=False,
-    )
-    # 启用 keepalive，防止空闲连接被断开
-    transport = client.get_transport()
-    if transport:
-        transport.set_keepalive(30)
+    client = _do_connect(host, p, user, pwd)
+    # 缓存连接参数，用于自动重连
+    _conn_params[alias] = {"host": host, "port": p, "username": user, "password": pwd}
     connections[alias] = client
     logger.info(f"[连接成功] {alias} ({user}@{host}:{p})")
     return f"成功连接到 {alias} ({user}@{host}:{p})"

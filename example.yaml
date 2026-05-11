@@ -1,0 +1,29 @@
+# SSH 主机配置文件示例
+# 使用前复制为 hosts.yaml 并填入真实信息：
+#   cp example.yaml hosts.yaml
+#
+# 格式说明：
+#   别名:
+#     host: IP地址或域名
+#     port: SSH端口 (默认22)
+#     username: 登录用户名
+#     password: 登录密码
+#     description: 主机描述 (可选)
+#
+# 使用方式：
+#   在对话中说 "连接主机1" 即可通过别名快速连接
+#   也可以说 "连接 192.168.1.100" 直接通过IP连接
+
+主机1:
+  host: 192.168.1.100
+  port: 22
+  username: root
+  password: "your_password"
+  description: "生产服务器"
+
+测试机:
+  host: 10.0.0.50
+  port: 2222
+  username: admin
+  password: "admin123"
+  description: "测试环境"

@@ -1,0 +1,22 @@
+# Python-generated files
+__pycache__/
+*.py[oc]
+build/
+dist/
+wheels/
+*.egg-info
+
+# Virtual environments
+.venv
+
+# Backups (contain remote server files)
+backups/
+
+# Lock file
+uv.lock
+
+# Host config (contains passwords)
+hosts.yaml
+
+# Logs
+logs/

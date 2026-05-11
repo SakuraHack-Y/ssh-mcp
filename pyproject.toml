@@ -1,0 +1,14 @@
+[project]
+name = "ssh-mcp"
+version = "0.1.0"
+description = "SSH MCP Server - 通过 MCP 协议管理和连接 SSH 主机"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "mcp>=1.27.1",
+    "paramiko>=5.0.0",
+    "pyyaml>=6.0.3",
+]
+
+[project.scripts]
+ssh-mcp = "ssh_mcp.server:main"
